@@ -1095,1077 +1095,510 @@ def line_font_size(
 # ============================================================
 
 
+def _pdf_font_name(name: str | None) -> str:
+    """Map common PDF font names to fonts that are usually available in Word."""
+    value = (name or "Arial").split("+")[-1].strip()
+    lowered = value.lower()
+    if "times" in lowered or "roman" in lowered:
+        return "Times New Roman"
+    if "courier" in lowered or "mono" in lowered:
+        return "Courier New"
+    if "arial" in lowered or "helvetica" in lowered or "calibri" in lowered:
+        return "Arial"
+    if "dejavu" in lowered:
+        return "DejaVu Sans"
+    return "Arial"
+
+
+def _pdf_color_rgb(value: int | None):
+    from docx.shared import RGBColor
+
+    packed = int(value or 0)
+    return RGBColor(
+        (packed >> 16) & 0xFF,
+        (packed >> 8) & 0xFF,
+        packed & 0xFF,
+    )
+
+
+def _configure_docx_section(section, page):
+    from docx.shared import Inches
+
+    width_in = max(1.0, float(page.rect.width) / 72.0)
+    height_in = max(1.0, float(page.rect.height) / 72.0)
+
+    section.page_width = Inches(width_in)
+    section.page_height = Inches(height_in)
+    section.top_margin = Inches(0.25)
+    section.bottom_margin = Inches(0.25)
+    section.left_margin = Inches(0.25)
+    section.right_margin = Inches(0.25)
+    section.header_distance = Inches(0.1)
+    section.footer_distance = Inches(0.1)
+
+
+def _add_docx_text_block(document, block, page_width_pt: float):
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Inches, Pt
+    from docx.oxml.ns import qn
+
+    bbox = block.get("bbox") or (0, 0, page_width_pt, 0)
+    x0, y0, x1, y1 = [float(v) for v in bbox]
+    paragraph = document.add_paragraph()
+    pf = paragraph.paragraph_format
+
+    # Approximate the original PDF horizontal position.
+    pf.left_indent = Inches(max(0.0, min((x0 / 72.0) - 0.25, max(0.0, page_width_pt / 72.0 - 0.5))))
+    pf.space_before = Pt(0)
+    pf.space_after = Pt(0)
+    pf.line_spacing = 1.0
+
+    lines = block.get("lines") or []
+    for line_index, line in enumerate(lines):
+        if line_index:
+            paragraph.add_run().add_break()
+
+        spans = line.get("spans") or []
+        for span in spans:
+            value = str(span.get("text") or "")
+            if not value:
+                continue
+
+            run = paragraph.add_run(value)
+            run.font.size = Pt(max(6.0, min(72.0, float(span.get("size") or 10.0))))
+            font_name = _pdf_font_name(span.get("font"))
+            run.font.name = font_name
+            try:
+                run._element.rPr.rFonts.set(qn("w:eastAsia"), font_name)
+            except Exception:
+                pass
+
+            flags = int(span.get("flags") or 0)
+            run.bold = bool(flags & 16)
+            run.italic = bool(flags & 2)
+
+            try:
+                run.font.color.rgb = _pdf_color_rgb(span.get("color"))
+            except Exception:
+                pass
+
+    # A paragraph containing only whitespace is not useful in DOCX.
+    if not paragraph.text.strip():
+        document._body._body.remove(paragraph._p)
+        return False
+
+    return True
+
+
+def _add_docx_image_block(document, block, page_width_pt: float):
+    from docx.shared import Inches
+
+    image_bytes = block.get("image")
+    if not image_bytes:
+        return False
+
+    bbox = block.get("bbox") or (0, 0, page_width_pt, page_width_pt)
+    x0, y0, x1, y1 = [float(v) for v in bbox]
+    width_pt = max(1.0, x1 - x0)
+    max_width_in = max(1.0, page_width_pt / 72.0 - 0.5)
+    width_in = min(width_pt / 72.0, max_width_in)
+
+    paragraph = document.add_paragraph()
+    paragraph.paragraph_format.left_indent = Inches(max(0.0, (x0 / 72.0) - 0.25))
+    paragraph.paragraph_format.space_before = Inches(max(0.0, y0 / 72.0) * 0.0)
+    paragraph.paragraph_format.space_after = Inches(0)
+
+    try:
+        run = paragraph.add_run()
+        run.add_picture(BytesIO(image_bytes), width=Inches(width_in))
+        return True
+    except Exception:
+        document._body._body.remove(paragraph._p)
+        return False
+
+
 def pdf_to_docx(
     source: Path,
     output: Path,
     language: str = "eng",
 ):
+    """Convert PDF pages into a real DOCX with editable native text and embedded images.
 
+    Native PDF text is reconstructed from PyMuPDF blocks/spans so font size, font family,
+    bold/italic state, color and approximate horizontal placement survive. Scanned pages
+    fall back to the existing Tesseract word reconstruction.
+    """
     from docx import Document
-
-    from docx.enum.section import (
-        WD_SECTION,
-    )
-
-    from docx.enum.text import (
-        WD_ALIGN_PARAGRAPH,
-    )
-
-    from docx.shared import (
-        Inches,
-        Pt,
-    )
-
+    from docx.enum.section import WD_SECTION
+    from docx.shared import Inches, Pt
     import fitz
 
     try:
-
-        pdf = fitz.open(
-            str(source)
-        )
-
+        pdf = fitz.open(str(source))
     except Exception as exc:
-
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"Could not open PDF: {exc}"
-            ),
-        )
+        raise HTTPException(status_code=422, detail=f"Could not open PDF: {exc}")
 
     try:
-
         if pdf.page_count == 0:
-
-            raise HTTPException(
-                status_code=422,
-                detail="The PDF has no pages.",
-            )
-
-        if (
-            pdf.page_count
-            > MAX_PDF_PAGES
-        ):
-
+            raise HTTPException(status_code=422, detail="The PDF has no pages.")
+        if pdf.page_count > MAX_PDF_PAGES:
             raise HTTPException(
                 status_code=413,
-                detail=(
-                    f"PDF contains more than "
-                    f"{MAX_PDF_PAGES} pages."
-                ),
+                detail=f"PDF contains more than {MAX_PDF_PAGES} pages.",
             )
 
         document = Document()
+        total_content = 0
 
-        first_page = True
+        for page_index, page in enumerate(pdf):
+            if page_index == 0:
+                section = document.sections[0]
+            else:
+                section = document.add_section(WD_SECTION.NEW_PAGE)
+            _configure_docx_section(section, page)
 
-        total_lines = 0
-
-        for page_index, page in enumerate(
-            pdf
-        ):
-
-            if not first_page:
-
-                document.add_section(
-                    WD_SECTION.NEW_PAGE
-                )
-
-            first_page = False
-
-            rect = page.rect
-
-            page_width = max(
-                1.0,
-                rect.width / 72.0,
+            page_dict = page.get_text("dict", sort=True) or {}
+            blocks = page_dict.get("blocks") or []
+            native_text = sum(
+                len(str(span.get("text") or ""))
+                for block in blocks
+                if block.get("type") == 0
+                for line in (block.get("lines") or [])
+                for span in (line.get("spans") or [])
             )
 
-            page_height = max(
-                1.0,
-                rect.height / 72.0,
-            )
+            if native_text >= OCR_MIN_TEXT_CHARS:
+                for block in blocks:
+                    block_type = block.get("type")
+                    if block_type == 0:
+                        if _add_docx_text_block(document, block, float(page.rect.width)):
+                            total_content += 1
+                    elif block_type == 1:
+                        if _add_docx_image_block(document, block, float(page.rect.width)):
+                            total_content += 1
+            else:
+                # Scanned/image-only page: use OCR words so the DOCX remains editable.
+                words = extract_pdf_words(page, language)
+                lines = group_words_into_lines(words)
+                previous_bottom = None
 
-            section = (
-                document.sections[-1]
-            )
+                for line in lines:
+                    text = str(line.get("text") or "").strip()
+                    if not text:
+                        continue
 
-            section.page_width = Inches(
-                page_width
-            )
+                    paragraph = document.add_paragraph()
+                    pf = paragraph.paragraph_format
+                    left = max(0.0, (float(line.get("x0", 0)) / 72.0) - 0.25)
+                    pf.left_indent = Inches(min(left, max(0.0, page.rect.width / 72.0 - 0.5)))
+                    if previous_bottom is not None:
+                        gap = max(0.0, float(line.get("top", 0)) - previous_bottom)
+                        pf.space_before = Pt(min(30.0, gap))
+                    pf.space_after = Pt(0)
+                    pf.line_spacing = 1.0
 
-            section.page_height = Inches(
-                page_height
-            )
+                    font_size = line_font_size(line)
+                    for index, word in enumerate(line.get("words") or []):
+                        if index:
+                            paragraph.add_run(" ")
+                        run = paragraph.add_run(str(word.get("text") or ""))
+                        run.font.size = Pt(font_size)
+                    previous_bottom = float(line.get("bottom", 0))
+                    total_content += 1
 
-            section.top_margin = Inches(
-                0.25
-            )
+            # Preserve an entirely blank page.
+            if not blocks and native_text == 0:
+                try:
+                    words = extract_pdf_words(page, language)
+                except Exception:
+                    words = []
+                if not words:
+                    document.add_paragraph("")
 
-            section.bottom_margin = Inches(
-                0.25
-            )
-
-            section.left_margin = Inches(
-                0.25
-            )
-
-            section.right_margin = Inches(
-                0.25
-            )
-
-            words = extract_pdf_words(
-                page,
-                language,
-            )
-
-            lines = (
-                group_words_into_lines(
-                    words
-                )
-            )
-
-            total_lines += len(
-                lines
-            )
-
-            previous_bottom = None
-
-            for line in lines:
-
-                text = (
-                    line["text"]
-                    .strip()
-                )
-
-                if not text:
-                    continue
-
-                paragraph = (
-                    document.add_paragraph()
-                )
-
-                paragraph.alignment = (
-                    WD_ALIGN_PARAGRAPH.LEFT
-                )
-
-                format_ = (
-                    paragraph.paragraph_format
-                )
-
-                left = max(
-                    0.0,
-                    line["x0"] / 72.0
-                    - 0.25,
-                )
-
-                max_left = max(
-                    0.0,
-                    page_width
-                    - 0.5,
-                )
-
-                format_.left_indent = Inches(
-                    min(
-                        left,
-                        max_left,
-                    )
-                )
-
-                if (
-                    previous_bottom
-                    is not None
-                ):
-
-                    gap = max(
-                        0.0,
-                        line["top"]
-                        - previous_bottom,
-                    )
-
-                    format_.space_before = Pt(
-                        min(
-                            30.0,
-                            gap,
-                        )
-                    )
-
-                else:
-
-                    format_.space_before = Pt(
-                        0
-                    )
-
-                format_.space_after = Pt(
-                    0
-                )
-
-                format_.line_spacing = 1.0
-
-                font_size = (
-                    line_font_size(
-                        line
-                    )
-                )
-
-                for index, word in enumerate(
-                    line["words"]
-                ):
-
-                    if index > 0:
-
-                        paragraph.add_run(
-                            " "
-                        )
-
-                    run = (
-                        paragraph.add_run(
-                            word["text"]
-                        )
-                    )
-
-                    run.font.size = Pt(
-                        font_size
-                    )
-
-                previous_bottom = (
-                    line["bottom"]
-                )
-
-            if not lines:
-
-                # Preserve completely empty/scanned
-                # pages as a page break rather than
-                # silently dropping them.
-
-                paragraph = (
-                    document.add_paragraph()
-                )
-
-                paragraph.add_run("")
-
-        if total_lines == 0:
-
+        if total_content == 0:
             raise HTTPException(
                 status_code=422,
-                detail=(
-                    "No readable text was found "
-                    "in this PDF. If this is a scanned "
-                    "PDF, install Tesseract OCR and "
-                    "the required OCR language."
-                ),
+                detail="No readable content was found in this PDF. If it is scanned, make sure the required Tesseract language is installed.",
             )
 
-        output.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        document.save(
-            str(output)
-        )
-
-    finally:
-
-        pdf.close()
-
-    return verify_output(
-        output,
-        "PDF → Word",
-    )
-
-
-# ============================================================
-# EXCEL HELPERS
-# ============================================================
-
-
-def clean_cell(
-    value: Any,
-) -> str:
-
-    if value is None:
-        return ""
-
-    text = str(
-        value
-    )
-
-    text = re.sub(
-        r"[ \t]+",
-        " ",
-        text,
-    )
-
-    text = re.sub(
-        r"\n{3,}",
-        "\n\n",
-        text,
-    )
-
-    return text.strip()
-
-
-def append_pdf_table(
-    worksheet,
-    table,
-) -> bool:
-
-    if not table:
-        return False
-
-    wrote = False
-
-    for row in table:
-
-        if not row:
-            continue
-
-        values = [
-            clean_cell(cell)
-            for cell in row
-        ]
-
-        if not any(
-            value
-            for value in values
-        ):
-            continue
-
-        worksheet.append(
-            values
-        )
-
-        wrote = True
-
-    return wrote
-
-
-def cluster_x_positions(
-    values: list[float],
-    tolerance: float = 18.0,
-):
-
-    if not values:
-        return []
-
-    positions = sorted(
-        values
-    )
-
-    clusters = []
-
-    for value in positions:
-
-        if not clusters:
-
-            clusters.append(
-                [value]
-            )
-            continue
-
-        current = (
-            clusters[-1]
-        )
-
-        center = (
-            sum(current)
-            / len(current)
-        )
-
-        if abs(
-            value - center
-        ) <= tolerance:
-
-            current.append(
-                value
-            )
-
-        else:
-
-            clusters.append(
-                [value]
-            )
-
-    return [
-        sum(cluster)
-        / len(cluster)
-        for cluster in clusters
-    ]
-
-
-def nearest_column(
-    x0: float,
-    columns: list[float],
-):
-
-    if not columns:
-        return 0
-
-    distances = [
-        abs(
-            x0 - column
-        )
-        for column in columns
-    ]
-
-    return distances.index(
-        min(distances)
-    )
-
-
-def words_to_excel_rows(
-    words: list[dict[str, Any]],
-    row_tolerance: float = 4.0,
-):
-
-    if not words:
-        return []
-
-    lines = (
-        group_words_into_lines(
-            words,
-            tolerance=row_tolerance,
-        )
-    )
-
-    if not lines:
-        return []
-
-    # Detect likely column starts.
-    starts = []
-
-    for line in lines:
-
-        for word in line[
-            "words"
-        ]:
-
-            starts.append(
-                word["x0"]
-            )
-
-    columns = cluster_x_positions(
-        starts,
-        tolerance=20.0,
-    )
-
-    rows = []
-
-    for line in lines:
-
-        row = [
-            ""
-            for _ in columns
-        ]
-
-        for word in line[
-            "words"
-        ]:
-
-            index = nearest_column(
-                word["x0"],
-                columns,
-            )
-
-            if not row[index]:
-
-                row[index] = (
-                    word["text"]
-                )
-
-            else:
-
-                row[index] += (
-                    " "
-                    + word["text"]
-                )
-
-        while (
-            row
-            and row[-1] == ""
-        ):
-
-            row.pop()
-
-        if any(row):
-
-            rows.append(
-                row
-            )
-
-    return rows
-
-
-# ============================================================
-# PDF → EXCEL
-# ============================================================
-
-
-def pdf_to_xlsx(
-    source: Path,
-    output: Path,
-    language: str = "eng",
-):
-
-    from openpyxl import Workbook
-
-    from openpyxl.styles import (
-        Alignment,
-        Font,
-    )
-
-    from openpyxl.utils import (
-        get_column_letter,
-    )
-
-    import pdfplumber
-
-    workbook = Workbook()
-
-    default_sheet = (
-        workbook.active
-    )
-
-    workbook.remove(
-        default_sheet
-    )
-
-    wrote_anything = False
-
-    try:
-
-        with pdfplumber.open(
-            str(source)
-        ) as pdf:
-
-            if len(pdf.pages) == 0:
-
-                raise HTTPException(
-                    status_code=422,
-                    detail="The PDF has no pages.",
-                )
-
-            if (
-                len(pdf.pages)
-                > MAX_PDF_PAGES
-            ):
-
-                raise HTTPException(
-                    status_code=413,
-                    detail=(
-                        f"PDF contains more than "
-                        f"{MAX_PDF_PAGES} pages."
-                    ),
-                )
-
-            for page_number, page in enumerate(
-                pdf.pages,
-                start=1,
-            ):
-
-                worksheet = (
-                    workbook.create_sheet(
-                        title=f"Page {page_number}"
-                    )
-                )
-
-                wrote_page = False
-
-                # ------------------------------------------------
-                # METHOD 1:
-                # Native table extraction
-                # ------------------------------------------------
-
-                table_settings = [
-
-                    {
-                        "vertical_strategy": "lines",
-                        "horizontal_strategy": "lines",
-                        "snap_tolerance": 4,
-                        "join_tolerance": 4,
-                        "intersection_tolerance": 4,
-                        "edge_min_length": 3,
-                        "text_tolerance": 3,
-                    },
-
-                    {
-                        "vertical_strategy": "text",
-                        "horizontal_strategy": "text",
-                        "snap_tolerance": 5,
-                        "join_tolerance": 5,
-                        "intersection_tolerance": 5,
-                        "edge_min_length": 3,
-                        "text_tolerance": 3,
-                    },
-
-                ]
-
-                extracted_tables = []
-
-                for settings in (
-                    table_settings
-                ):
-
-                    try:
-
-                        tables = (
-                            page.extract_tables(
-                                table_settings=settings
-                            )
-                            or []
-                        )
-
-                        for table in tables:
-
-                            if table:
-
-                                extracted_tables.append(
-                                    table
-                                )
-
-                    except Exception:
-                        continue
-
-                for table in (
-                    extracted_tables
-                ):
-
-                    if append_pdf_table(
-                        worksheet,
-                        table,
-                    ):
-
-                        wrote_page = True
-                        wrote_anything = True
-
-                        worksheet.append([])
-
-                # ------------------------------------------------
-                # METHOD 2:
-                # Native coordinate-aware text
-                # ------------------------------------------------
-
-                if not wrote_page:
-
-                    try:
-
-                        raw_words = (
-                            page.extract_words(
-                                x_tolerance=2,
-                                y_tolerance=3,
-                                keep_blank_chars=False,
-                                use_text_flow=False,
-                            )
-                            or []
-                        )
-
-                    except Exception:
-
-                        raw_words = []
-
-                    native_words = []
-
-                    for word in raw_words:
-
-                        text = clean_cell(
-                            word.get(
-                                "text",
-                                "",
-                            )
-                        )
-
-                        if not text:
-                            continue
-
-                        native_words.append(
-                            {
-                                "text": text,
-                                "x0": float(
-                                    word.get(
-                                        "x0",
-                                        0,
-                                    )
-                                ),
-                                "x1": float(
-                                    word.get(
-                                        "x1",
-                                        0,
-                                    )
-                                ),
-                                "top": float(
-                                    word.get(
-                                        "top",
-                                        0,
-                                    )
-                                ),
-                                "bottom": float(
-                                    word.get(
-                                        "bottom",
-                                        0,
-                                    )
-                                ),
-                                "height": max(
-                                    1.0,
-                                    float(
-                                        word.get(
-                                            "bottom",
-                                            0,
-                                        )
-                                    )
-                                    - float(
-                                        word.get(
-                                            "top",
-                                            0,
-                                        )
-                                    ),
-                                ),
-                                "source": "pdf",
-                            }
-                        )
-
-                    if native_words:
-
-                        rows = (
-                            words_to_excel_rows(
-                                native_words,
-                                row_tolerance=4,
-                            )
-                        )
-
-                        for row in rows:
-
-                            worksheet.append(
-                                row
-                            )
-
-                            wrote_page = True
-                            wrote_anything = True
-
-                # ------------------------------------------------
-                # METHOD 3:
-                # OCR fallback
-                # ------------------------------------------------
-
-                if not wrote_page:
-
-                    try:
-
-                        import fitz
-
-                        fitz_pdf = fitz.open(
-                            str(source)
-                        )
-
-                        fitz_page = (
-                            fitz_pdf[
-                                page_number - 1
-                            ]
-                        )
-
-                        ocr_words = run_ocr(
-                            fitz_page,
-                            language,
-                        )
-
-                        fitz_pdf.close()
-
-                        rows = (
-                            words_to_excel_rows(
-                                ocr_words,
-                                row_tolerance=6,
-                            )
-                        )
-
-                        for row in rows:
-
-                            worksheet.append(
-                                row
-                            )
-
-                            wrote_page = True
-                            wrote_anything = True
-
-                    except HTTPException:
-
-                        raise
-
-                    except Exception as exc:
-
-                        raise HTTPException(
-                            status_code=422,
-                            detail=(
-                                "PDF → Excel could not "
-                                f"extract page {page_number}: "
-                                f"{exc}"
-                            ),
-                        )
-
-                # ------------------------------------------------
-                # PAGE FALLBACK
-                # ------------------------------------------------
-
-                if not wrote_page:
-
-                    worksheet.append(
-                        [
-                            "No readable text or table "
-                            "data found on this page."
-                        ]
-                    )
-
-                # ------------------------------------------------
-                # EXCEL FORMATTING
-                # ------------------------------------------------
-
-                for row in (
-                    worksheet.iter_rows()
-                ):
-
-                    for cell in row:
-
-                        cell.alignment = (
-                            Alignment(
-                                vertical="top",
-                                wrap_text=True,
-                            )
-                        )
-
-                if worksheet.max_row > 0:
-
-                    for cell in worksheet[1]:
-
-                        cell.font = Font(
-                            bold=True
-                        )
-
-                for column_cells in (
-                    worksheet.columns
-                ):
-
-                    if not column_cells:
-                        continue
-
-                    column_index = (
-                        column_cells[0]
-                        .column
-                    )
-
-                    letter = (
-                        get_column_letter(
-                            column_index
-                        )
-                    )
-
-                    maximum = 10
-
-                    for cell in column_cells:
-
-                        value = str(
-                            cell.value
-                            or ""
-                        )
-
-                        maximum = max(
-                            maximum,
-                            min(
-                                60,
-                                len(value)
-                                + 2,
-                            ),
-                        )
-
-                    worksheet.column_dimensions[
-                        letter
-                    ].width = min(
-                        60,
-                        maximum,
-                    )
-
-                worksheet.freeze_panes = "A2"
-
+        output.parent.mkdir(parents=True, exist_ok=True)
+        document.save(str(output))
     except HTTPException:
         raise
-
     except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not create Word document: {exc}")
+    finally:
+        pdf.close()
 
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"PDF → Excel extraction failed: "
-                f"{exc}"
-            ),
-        )
+    return verify_output(output, "PDF → Word")
 
-    if not wrote_anything:
+def _pptx_font_name(name: str | None) -> str:
+    value = (name or "Arial").split("+")[-1].strip()
+    lowered = value.lower()
+    if "times" in lowered or "roman" in lowered:
+        return "Times New Roman"
+    if "courier" in lowered or "mono" in lowered:
+        return "Courier New"
+    if "arial" in lowered or "helvetica" in lowered or "calibri" in lowered:
+        return "Arial"
+    if "dejavu" in lowered:
+        return "DejaVu Sans"
+    return "Arial"
 
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "No readable text or table data "
-                "was found in this PDF."
-            ),
-        )
 
-    output.parent.mkdir(
-        parents=True,
-        exist_ok=True,
+def _pptx_color_rgb(value: int | None):
+    from pptx.dml.color import RGBColor
+
+    packed = int(value or 0)
+    return RGBColor(
+        (packed >> 16) & 0xFF,
+        (packed >> 8) & 0xFF,
+        packed & 0xFF,
     )
+
+
+def _add_pptx_text_block(slide, block, page_rect, slide_width, slide_height):
+    from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE
+    from pptx.util import Inches, Pt
+
+    bbox = block.get("bbox")
+    if not bbox:
+        return False
+
+    page_w = max(1.0, float(page_rect.width))
+    page_h = max(1.0, float(page_rect.height))
+    sx = float(slide_width) / page_w
+    sy = float(slide_height) / page_h
+
+    x0, y0, x1, y1 = [float(v) for v in bbox]
+    left = max(0, int(x0 * sx))
+    top = max(0, int(y0 * sy))
+    width = max(1, int((x1 - x0) * sx))
+    height = max(1, int((y1 - y0) * sy))
+
+    shape = slide.shapes.add_textbox(left, top, width, height)
+    tf = shape.text_frame
+    tf.clear()
+    tf.word_wrap = False
+    tf.auto_size = MSO_AUTO_SIZE.NONE
+    tf.margin_left = 0
+    tf.margin_right = 0
+    tf.margin_top = 0
+    tf.margin_bottom = 0
+
+    lines = block.get("lines") or []
+    first_paragraph = True
+    added = False
+
+    for line in lines:
+        paragraph = tf.paragraphs[0] if first_paragraph else tf.add_paragraph()
+        first_paragraph = False
+        paragraph.space_before = Pt(0)
+        paragraph.space_after = Pt(0)
+        paragraph.line_spacing = 1.0
+
+        spans = line.get("spans") or []
+        for span in spans:
+            value = str(span.get("text") or "")
+            if not value:
+                continue
+            run = paragraph.add_run()
+            run.text = value
+            run.font.name = _pptx_font_name(span.get("font"))
+            run.font.size = Pt(max(6.0, min(96.0, float(span.get("size") or 10.0))))
+            flags = int(span.get("flags") or 0)
+            run.font.bold = bool(flags & 16)
+            run.font.italic = bool(flags & 2)
+            try:
+                run.font.color.rgb = _pptx_color_rgb(span.get("color"))
+            except Exception:
+                pass
+            added = True
+
+    if not added:
+        slide.shapes._spTree.remove(shape._element)
+        return False
+
+    # PDF text is generally left aligned; preserve obvious centered/right blocks.
+    block_center = (x0 + x1) / 2.0
+    page_center = page_w / 2.0
+    if abs(block_center - page_center) <= page_w * 0.08:
+        for paragraph in tf.paragraphs:
+            paragraph.alignment = PP_ALIGN.CENTER
+
+    return True
+
+
+def _add_pptx_image_block(slide, block, page_rect, slide_width, slide_height):
+    from pptx.util import Inches
+
+    image_bytes = block.get("image")
+    bbox = block.get("bbox")
+    if not image_bytes or not bbox:
+        return False
+
+    page_w = max(1.0, float(page_rect.width))
+    page_h = max(1.0, float(page_rect.height))
+    sx = float(slide_width) / page_w
+    sy = float(slide_height) / page_h
+    x0, y0, x1, y1 = [float(v) for v in bbox]
+
+    left = int(x0 * sx)
+    top = int(y0 * sy)
+    width = max(1, int((x1 - x0) * sx))
+    height = max(1, int((y1 - y0) * sy))
 
     try:
+        slide.shapes.add_picture(BytesIO(image_bytes), left, top, width=width, height=height)
+        return True
+    except Exception:
+        return False
 
-        workbook.save(
-            str(output)
+
+def _add_pptx_ocr_page(slide, page, language, slide_width, slide_height):
+    """Add editable OCR text to a slide for scanned PDFs."""
+    words = extract_pdf_words(page, language)
+    lines = group_words_into_lines(words)
+    if not lines:
+        return False
+
+    page_rect = page.rect
+    page_w = max(1.0, float(page_rect.width))
+    page_h = max(1.0, float(page_rect.height))
+    sx = float(slide_width) / page_w
+    sy = float(slide_height) / page_h
+    added = False
+
+    from pptx.util import Pt
+
+    for line in lines:
+        x0 = float(line.get("x0", 0))
+        y0 = float(line.get("top", 0))
+        x1 = float(line.get("x1", x0 + 10))
+        y1 = float(line.get("bottom", y0 + 12))
+        shape = slide.shapes.add_textbox(
+            int(x0 * sx),
+            int(y0 * sy),
+            max(1, int((x1 - x0) * sx)),
+            max(1, int((y1 - y0) * sy)),
         )
+        tf = shape.text_frame
+        tf.clear()
+        tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = 0
+        run = tf.paragraphs[0].add_run()
+        run.text = str(line.get("text") or "")
+        run.font.name = "Arial"
+        run.font.size = Pt(line_font_size(line))
+        added = True
 
-    except Exception as exc:
-
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                f"Could not create Excel file: "
-                f"{exc}"
-            ),
-        )
-
-    return verify_output(
-        output,
-        "PDF → Excel",
-    )
-
-
-# ============================================================
-# PDF → POWERPOINT
-# ============================================================
+    return added
 
 
 def pdf_to_pptx(
     source: Path,
     output: Path,
+    language: str = "eng",
 ):
+    """Convert PDF to an editable PowerPoint.
 
+    Native PDF text becomes PowerPoint text boxes with editable runs. Native PDF raster
+    images become PowerPoint pictures. Scanned pages use OCR text boxes; a page screenshot
+    is used only when a page contains no extractable content at all.
+    """
     from pptx import Presentation
-
     from pptx.util import Inches
-
     import fitz
 
-    pdf = _fitz_open(
-        source
-    )
-
+    pdf = _fitz_open(source)
     try:
-
         if pdf.page_count == 0:
-
-            raise HTTPException(
-                status_code=422,
-                detail="The PDF has no pages.",
-            )
-
-        if (
-            pdf.page_count
-            > MAX_PDF_PAGES
-        ):
-
+            raise HTTPException(status_code=422, detail="The PDF has no pages.")
+        if pdf.page_count > MAX_PDF_PAGES:
             raise HTTPException(
                 status_code=413,
-                detail=(
-                    f"PDF contains more than "
-                    f"{MAX_PDF_PAGES} pages."
-                ),
+                detail=f"PDF contains more than {MAX_PDF_PAGES} pages.",
             )
 
-        first_rect = (
-            pdf[0].rect
-        )
+        first_rect = pdf[0].rect
+        page_ratio = float(first_rect.width) / max(1.0, float(first_rect.height))
 
-        ratio = (
-            first_rect.width
-            / max(
-                1,
-                first_rect.height,
-            )
-        )
+        # Keep the longest slide dimension at 13.333 in so portrait PDFs do not create
+        # invalid PowerPoint dimensions.
+        if page_ratio >= 1:
+            slide_width_in = 13.333
+            slide_height_in = 13.333 / page_ratio
+        else:
+            slide_height_in = 13.333
+            slide_width_in = 13.333 * page_ratio
 
-        presentation = (
-            Presentation()
-        )
-
-        presentation.slide_width = (
-            Inches(13.333)
-        )
-
-        presentation.slide_height = (
-            Inches(
-                13.333
-                / ratio
-            )
-        )
-
-        blank_layout = (
-            presentation
-            .slide_layouts[6]
-        )
+        presentation = Presentation()
+        presentation.slide_width = Inches(slide_width_in)
+        presentation.slide_height = Inches(slide_height_in)
+        blank_layout = presentation.slide_layouts[6]
 
         for page in pdf:
+            slide = presentation.slides.add_slide(blank_layout)
+            page_dict = page.get_text("dict", sort=True) or {}
+            blocks = page_dict.get("blocks") or []
 
-            pixmap = page.get_pixmap(
-                matrix=fitz.Matrix(
-                    2,
-                    2,
-                ),
-                alpha=False,
+            native_text = sum(
+                len(str(span.get("text") or ""))
+                for block in blocks
+                if block.get("type") == 0
+                for line in (block.get("lines") or [])
+                for span in (line.get("spans") or [])
             )
 
-            slide = (
-                presentation
-                .slides
-                .add_slide(
-                    blank_layout
+            added = False
+            if native_text >= OCR_MIN_TEXT_CHARS:
+                for block in blocks:
+                    if block.get("type") == 0:
+                        added = _add_pptx_text_block(
+                            slide,
+                            block,
+                            page.rect,
+                            presentation.slide_width,
+                            presentation.slide_height,
+                        ) or added
+                    elif block.get("type") == 1:
+                        added = _add_pptx_image_block(
+                            slide,
+                            block,
+                            page.rect,
+                            presentation.slide_width,
+                            presentation.slide_height,
+                        ) or added
+            else:
+                added = _add_pptx_ocr_page(
+                    slide,
+                    page,
+                    language,
+                    presentation.slide_width,
+                    presentation.slide_height,
                 )
-            )
 
-            slide.shapes.add_picture(
-                BytesIO(
-                    pixmap.tobytes(
-                        "png"
-                    )
-                ),
-                0,
-                0,
-                width=(
-                    presentation
-                    .slide_width
-                ),
-                height=(
-                    presentation
-                    .slide_height
-                ),
-            )
+            # If a PDF page truly contains no readable text/image blocks, retain it as
+            # a visual page rather than returning an empty slide.
+            if not added:
+                pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                slide.shapes.add_picture(
+                    BytesIO(pixmap.tobytes("png")),
+                    0,
+                    0,
+                    width=presentation.slide_width,
+                    height=presentation.slide_height,
+                )
 
-        output.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        presentation.save(
-            str(output)
-        )
-
+        output.parent.mkdir(parents=True, exist_ok=True)
+        presentation.save(str(output))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not create PowerPoint: {exc}")
     finally:
-
         pdf.close()
 
-    return verify_output(
-        output,
-        "PDF → PowerPoint",
-    )
-
-
-# ============================================================
-# FITZ OPEN
-# ============================================================
-
+    return verify_output(output, "PDF → PowerPoint")
 
 def _fitz_open(
     source: Path,
@@ -3228,6 +2661,7 @@ async def convert(
                     outdir
                     / f"{source.stem}.pptx"
                 ),
+                normalize_ocr_language(language),
             )
 
             return file_response(
