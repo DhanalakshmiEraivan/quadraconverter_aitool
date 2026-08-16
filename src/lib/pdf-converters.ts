@@ -72,37 +72,55 @@ function dataUrlToUint8Array(dataUrl: string): Uint8Array {
 }
 
 
-function expectedOutputForOperation(operation: string): { extension: string; mime: string; kind: 'pdf' | 'zip' | 'text' | 'unknown' } {
+function expectedOutputForOperation(
+  operation: string
+): {
+  extension: string;
+  mime: string;
+  kind: 'pdf' | 'zip' | 'text' | 'unknown';
+} {
   switch (operation) {
     case 'office-to-pdf':
     case 'html-to-pdf':
     case 'pdf-unlock':
     case 'pdf-protect':
     case 'pdf-to-pdfa':
-      return { extension: '.pdf', mime: 'application/pdf', kind: 'pdf' };
+    case 'pdf-translate':
+      return {
+        extension: '.pdf',
+        mime: 'application/pdf',
+        kind: 'pdf',
+      };
+
     case 'pdf-to-word':
       return {
         extension: '.docx',
         mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
         kind: 'zip',
       };
+
     case 'pdf-to-pptx':
       return {
         extension: '.pptx',
         mime: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
         kind: 'zip',
       };
+
     case 'pdf-to-xlsx':
       return {
         extension: '.xlsx',
         mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         kind: 'zip',
       };
+
     default:
-      return { extension: '', mime: '', kind: 'unknown' };
+      return {
+        extension: '',
+        mime: '',
+        kind: 'unknown',
+      };
   }
 }
-
 async function validateServerOutput(blob: Blob, operation: string, filename: string): Promise<void> {
   const expected = expectedOutputForOperation(operation);
   if (expected.kind === 'unknown') return;
@@ -158,6 +176,7 @@ async function serverConvert(
   }
 
   const form = new FormData();
+
   form.append('file', file, file.name);
   form.append('operation', operation);
 
@@ -166,9 +185,13 @@ async function serverConvert(
   });
 
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), 10 * 60 * 1000);
+
+  const timeout = window.setTimeout(() => {
+    controller.abort();
+  }, 10 * 60 * 1000);
 
   let response: Response;
+
   try {
     response = await fetch(`${baseUrl}/convert`, {
       method: 'POST',
@@ -179,9 +202,15 @@ async function serverConvert(
       },
     });
   } catch (error) {
-    if (error instanceof DOMException && error.name === 'AbortError') {
-      throw new Error('The conversion server timed out. Please try a smaller file.');
+    if (
+      error instanceof DOMException &&
+      error.name === 'AbortError'
+    ) {
+      throw new Error(
+        'The conversion server timed out. Please try a smaller file.'
+      );
     }
+
     throw new Error(
       'Cannot connect to the QuadraConverter conversion server. Verify VITE_CONVERTER_API_URL, the backend is running, and CORS allows this website.'
     );
@@ -190,94 +219,255 @@ async function serverConvert(
   }
 
   if (!response.ok) {
-    let message = `Conversion server returned HTTP ${response.status}.`;
+    let message =
+      `Conversion server returned HTTP ${response.status}.`;
+
     try {
       const payload = await response.json();
-      message = payload?.detail || payload?.error || message;
+
+      message =
+        payload?.detail ||
+        payload?.error ||
+        message;
     } catch {
-      // Keep the HTTP status when the backend did not return JSON.
+      // Keep HTTP status when backend does not return JSON.
     }
+
     throw new Error(message);
   }
 
   const blob = await response.blob();
-  if (!blob.size) throw new Error('The conversion server returned an empty file.');
 
-
- const disposition =
-  response.headers.get('content-disposition') || '';
-
-const headerFilename =
-  response.headers.get('x-converted-filename')?.trim() || '';
-
-let dispositionFilename = '';
-
-const utf8Match = disposition.match(
-  /filename\*=UTF-8''([^;]+)/i
-);
-
-if (utf8Match?.[1]) {
-  try {
-    dispositionFilename = decodeURIComponent(
-      utf8Match[1].trim().replace(/^["']|["']$/g, '')
+  if (!blob.size) {
+    throw new Error(
+      'The conversion server returned an empty file.'
     );
-  } catch {
-    dispositionFilename = utf8Match[1].trim().replace(/^["']|["']$/g, '');
   }
-}
 
-if (!dispositionFilename) {
-  const normalMatch = disposition.match(
-    /filename="?([^";]+)"?/i
+  /*
+   * ---------------------------------------------------------
+   * READ BACKEND FILENAME
+   * ---------------------------------------------------------
+   */
+
+  const disposition =
+    response.headers.get('content-disposition') || '';
+
+  const headerFilename =
+    response.headers
+      .get('x-converted-filename')
+      ?.trim() || '';
+
+  let dispositionFilename = '';
+
+  /*
+   * RFC 5987 / UTF-8 filename
+   *
+   * Example:
+   * filename*=UTF-8''my%20document.docx
+   */
+
+  const utf8Match =
+    disposition.match(
+      /filename\*=UTF-8''([^;]+)/i
+    );
+
+  if (utf8Match?.[1]) {
+    try {
+      dispositionFilename =
+        decodeURIComponent(
+          utf8Match[1]
+            .trim()
+            .replace(/^["']|["']$/g, '')
+        );
+    } catch {
+      dispositionFilename =
+        utf8Match[1]
+          .trim()
+          .replace(/^["']|["']$/g, '');
+    }
+  }
+
+  /*
+   * Normal filename
+   *
+   * Example:
+   * filename="document.docx"
+   */
+
+  if (!dispositionFilename) {
+    const normalMatch =
+      disposition.match(
+        /filename="?([^";]+)"?/i
+      );
+
+    if (normalMatch?.[1]) {
+      dispositionFilename =
+        normalMatch[1].trim();
+    }
+  }
+
+  /*
+   * ---------------------------------------------------------
+   * FALLBACK EXTENSIONS
+   * ---------------------------------------------------------
+   *
+   * NEVER use:
+   *
+   *   .converted
+   *
+   * because that creates:
+   *
+   *   optimized.converted
+   *
+   * Instead, derive the correct extension from the operation.
+   */
+
+  const extensionByOperation: Record<
+    string,
+    string
+  > = {
+    'pdf-to-word': '.docx',
+    'pdf-to-pptx': '.pptx',
+    'pdf-to-xlsx': '.xlsx',
+
+    'office-to-pdf': '.pdf',
+    'html-to-pdf': '.pdf',
+
+    'pdf-to-pdfa': '.pdf',
+    'pdf-unlock': '.pdf',
+    'pdf-protect': '.pdf',
+    'pdf-translate': '.pdf',
+  };
+
+  /*
+   * Remove original extension.
+   *
+   * example:
+   *
+   * report.pdf
+   *
+   * becomes:
+   *
+   * report
+   */
+
+  const originalBaseName =
+    file.name.replace(/\.[^.]+$/, '');
+
+  const fallbackExtension =
+    extensionByOperation[operation] ||
+    '.bin';
+
+  const fallbackFilename =
+    `${originalBaseName}${fallbackExtension}`;
+
+  /*
+   * Priority:
+   *
+   * 1. X-Converted-Filename
+   * 2. Content-Disposition
+   * 3. Operation-based fallback
+   */
+
+  let filename =
+    headerFilename ||
+    dispositionFilename ||
+    fallbackFilename;
+
+  /*
+   * ---------------------------------------------------------
+   * SANITIZE FILENAME
+   * ---------------------------------------------------------
+   *
+   * Prevent backend paths from reaching the browser.
+   */
+
+  filename =
+    filename
+      .split(/[/\\]/)
+      .pop()
+      ?.trim() || fallbackFilename;
+
+  /*
+   * Remove accidental surrounding quotes.
+   */
+
+  filename =
+    filename.replace(/^["']|["']$/g, '').trim();
+
+  /*
+   * ---------------------------------------------------------
+   * ABSOLUTE PROTECTION AGAINST .converted
+   * ---------------------------------------------------------
+   *
+   * If an old backend returns:
+   *
+   * optimized.converted
+   *
+   * replace it with the correct extension.
+   */
+
+  if (
+    filename.toLowerCase().endsWith('.converted')
+  ) {
+    filename =
+      `${originalBaseName}${fallbackExtension}`;
+  }
+
+  /*
+   * ---------------------------------------------------------
+   * ENSURE CORRECT EXTENSION
+   * ---------------------------------------------------------
+   */
+
+  const expected =
+    expectedOutputForOperation(operation);
+
+  if (
+    expected.extension &&
+    !filename
+      .toLowerCase()
+      .endsWith(
+        expected.extension.toLowerCase()
+      )
+  ) {
+    /*
+     * The backend may have returned a filename
+     * with the wrong extension.
+     *
+     * Do NOT allow it to reach the user.
+     */
+
+    filename =
+      `${originalBaseName}${expected.extension}`;
+  }
+
+  /*
+   * ---------------------------------------------------------
+   * VALIDATE ACTUAL FILE CONTENT
+   * ---------------------------------------------------------
+   */
+
+  await validateServerOutput(
+    blob,
+    operation,
+    filename
   );
 
-  if (normalMatch?.[1]) {
-    dispositionFilename = normalMatch[1].trim();
-  }
-}
+  /*
+   * ---------------------------------------------------------
+   * RETURN RESULT
+   * ---------------------------------------------------------
+   */
 
-/*
- * Never use ".converted" for server conversions.
- * The backend is responsible for returning the correct
- * extension. If the browser cannot read the filename
- * headers, derive the extension from the operation.
- */
-const extensionByOperation: Record<string, string> = {
-  'pdf-to-word': '.docx',
-  'pdf-to-pptx': '.pptx',
-  'pdf-to-xlsx': '.xlsx',
-  'office-to-pdf': '.pdf',
-  'html-to-pdf': '.pdf',
-  'pdf-to-pdfa': '.pdf',
-  'pdf-unlock': '.pdf',
-  'pdf-protect': '.pdf',
-  'pdf-translate': '.pdf',
-};
-
-const originalBaseName =
-  file.name.replace(/\.[^.]+$/, '');
-
-const fallbackExtension =
-  extensionByOperation[operation] || '.bin';
-
-const fallbackFilename =
-  `${originalBaseName}${fallbackExtension}`;
-
-const filename =
-  headerFilename ||
-  dispositionFilename ||
-  fallbackFilename;
-
-  // Never allow a backend/path-like filename to reach the browser download attribute.
-  filename = filename.split(/[/\\]/).pop() || 'converted-file';
-
-  await validateServerOutput(blob, operation, filename);
-
-  const expected = expectedOutputForOperation(operation);
   return {
     blob,
     filename,
-    mimeType: expected.mime || blob.type || 'application/octet-stream',
+    mimeType:
+      expected.mime ||
+      blob.type ||
+      'application/octet-stream',
   };
 }
 
