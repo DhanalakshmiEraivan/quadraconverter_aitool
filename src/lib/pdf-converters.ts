@@ -72,143 +72,173 @@ function dataUrlToUint8Array(dataUrl: string): Uint8Array {
 }
 
 
+function expectedOutputForOperation(operation: string): { extension: string; mime: string; kind: 'pdf' | 'zip' | 'text' | 'unknown' } {
+  switch (operation) {
+    case 'office-to-pdf':
+    case 'html-to-pdf':
+    case 'pdf-unlock':
+    case 'pdf-protect':
+    case 'pdf-to-pdfa':
+      return { extension: '.pdf', mime: 'application/pdf', kind: 'pdf' };
+    case 'pdf-to-word':
+      return {
+        extension: '.docx',
+        mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        kind: 'zip',
+      };
+    case 'pdf-to-pptx':
+      return {
+        extension: '.pptx',
+        mime: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        kind: 'zip',
+      };
+    case 'pdf-to-xlsx':
+      return {
+        extension: '.xlsx',
+        mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        kind: 'zip',
+      };
+    default:
+      return { extension: '', mime: '', kind: 'unknown' };
+  }
+}
+
+async function validateServerOutput(blob: Blob, operation: string, filename: string): Promise<void> {
+  const expected = expectedOutputForOperation(operation);
+  if (expected.kind === 'unknown') return;
+
+  const lowerName = filename.toLowerCase();
+  if (expected.extension && !lowerName.endsWith(expected.extension)) {
+    throw new Error(
+      `The conversion server returned an invalid filename for ${operation}: ${filename}`
+    );
+  }
+
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  if (!bytes.length) throw new Error('The conversion server returned an empty file.');
+
+  if (expected.kind === 'pdf') {
+    const signature = new TextDecoder().decode(bytes.slice(0, 5));
+    if (signature !== '%PDF-') {
+      throw new Error('The conversion server returned a file that is not a valid PDF.');
+    }
+  }
+
+  if (expected.kind === 'zip') {
+    // DOCX/PPTX/XLSX are Open XML ZIP containers and must start with PK.
+    if (bytes[0] !== 0x50 || bytes[1] !== 0x4b) {
+      throw new Error(
+        `The conversion server returned an invalid ${expected.extension.toUpperCase()} file. The server generated data, but not a valid Office document.`
+      );
+    }
+  }
+}
+
 async function serverConvert(
   file: File,
   operation: string,
   server: string,
   fields: Record<string, string> = {}
 ): Promise<ConvertResult> {
-  const baseUrl =
-    server.trim().replace(/\/+$/, '');
+  const baseUrl = server.trim().replace(/\/+$/, '');
 
   if (!/^https?:\/\//i.test(baseUrl)) {
     throw new Error(
-      'Invalid VITE_CONVERTER_API_URL. It must point to your QuadraConverter FastAPI conversion server.'
+      'Invalid VITE_CONVERTER_API_URL. It must be the public URL of your QuadraConverter FastAPI server.'
     );
   }
 
-  const form =
-    new FormData();
-
-  form.append(
-    'file',
-    file,
-    file.name
-  );
-
-  form.append(
-    'operation',
-    operation
-  );
-
-  Object.entries(fields).forEach(
-    ([key, value]) => {
-      form.append(key, value);
-    }
-  );
-
-  const controller =
-    new AbortController();
-
-  const timeout =
-    window.setTimeout(
-      () => controller.abort(),
-      10 * 60 * 1000
+  if (
+    import.meta.env.PROD &&
+    /https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(baseUrl)
+  ) {
+    throw new Error(
+      'Production is still pointing to localhost. Deploy the QuadraConverter FastAPI server and set VITE_CONVERTER_API_URL to its public HTTPS URL, then rebuild the Vercel frontend.'
     );
+  }
+
+  const form = new FormData();
+  form.append('file', file, file.name);
+  form.append('operation', operation);
+
+  Object.entries(fields).forEach(([key, value]) => {
+    form.append(key, value);
+  });
+
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 10 * 60 * 1000);
 
   let response: Response;
-
   try {
-    response =
-      await fetch(
-        `${baseUrl}/convert`,
-        {
-          method: 'POST',
-          body: form,
-          signal:
-            controller.signal,
-        }
-      );
+    response = await fetch(`${baseUrl}/convert`, {
+      method: 'POST',
+      body: form,
+      signal: controller.signal,
+      headers: {
+        Accept: '*/*',
+      },
+    });
   } catch (error) {
-    if (
-      error instanceof DOMException &&
-      error.name === 'AbortError'
-    ) {
-      throw new Error(
-        'The conversion server timed out. Please try a smaller file.'
-      );
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      throw new Error('The conversion server timed out. Please try a smaller file.');
     }
-
     throw new Error(
-      'Cannot connect to the QuadraConverter conversion server. Check VITE_CONVERTER_API_URL and make sure the conversion server is running.'
+      'Cannot connect to the QuadraConverter conversion server. Verify VITE_CONVERTER_API_URL, the backend is running, and CORS allows this website.'
     );
   } finally {
-    window.clearTimeout(
-      timeout
-    );
+    window.clearTimeout(timeout);
   }
 
   if (!response.ok) {
-    let message =
-      `Conversion server returned HTTP ${response.status}.`;
-
+    let message = `Conversion server returned HTTP ${response.status}.`;
     try {
-      const payload =
-        await response.json();
-
-      message =
-        payload?.detail ||
-        payload?.error ||
-        message;
+      const payload = await response.json();
+      message = payload?.detail || payload?.error || message;
     } catch {
-      // Non-JSON error.
+      // Keep the HTTP status when the backend did not return JSON.
     }
-
     throw new Error(message);
   }
-  const blob =
-    await response.blob();
 
-  if (!blob.size) {
-    throw new Error(
-      'The conversion server returned an empty file.'
-    );
+  const blob = await response.blob();
+  if (!blob.size) throw new Error('The conversion server returned an empty file.');
+
+  const disposition = response.headers.get('content-disposition') || '';
+  const headerFilename = response.headers.get('x-converted-filename') || '';
+
+  let filename = headerFilename.trim();
+  if (!filename) {
+    const utf8Match = disposition.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
+    const normalMatch = disposition.match(/filename\s*=\s*"([^"]+)"/i) || disposition.match(/filename\s*=\s*([^;]+)/i);
+    const raw = utf8Match?.[1] || normalMatch?.[1] || '';
+    if (raw) {
+      try {
+        filename = decodeURIComponent(raw.trim().replace(/^"|"$/g, ''));
+      } catch {
+        filename = raw.trim().replace(/^"|"$/g, '');
+      }
+    }
   }
 
-  const disposition =
-    response.headers.get(
-      'content-disposition'
-    ) || '';
+  if (!filename) {
+    const expected = expectedOutputForOperation(operation);
+    const base = file.name.replace(/\.[^.]+$/, '');
+    filename = `${base}${expected.extension || '.converted'}`;
+  }
 
-  const match =
-    disposition.match(
-      /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i
-    );
+  // Never allow a backend/path-like filename to reach the browser download attribute.
+  filename = filename.split(/[/\\]/).pop() || 'converted-file';
 
-  const filename =
-    response.headers.get(
-      'x-converted-filename'
-    ) ||
-    (
-      match?.[1]
-        ? decodeURIComponent(
-            match[1]
-          )
-        : null
-    ) ||
-    file.name.replace(
-      /\.[^.]+$/,
-      '.converted'
-    );
+  await validateServerOutput(blob, operation, filename);
 
+  const expected = expectedOutputForOperation(operation);
   return {
     blob,
     filename,
-    mimeType:
-      blob.type ||
-      'application/octet-stream',
+    mimeType: expected.mime || blob.type || 'application/octet-stream',
   };
 }
+
 // ─── Merge PDFs ───
 export async function mergePDFs(files: File[]): Promise<ConvertResult> {
   const merged = await PDFDocument.create();
@@ -504,7 +534,13 @@ export async function pdfToWord(
     }
   );
 }
-export async function pdfToPPTX(file: File): Promise<ConvertResult> { const server=import.meta.env.VITE_CONVERTER_API_URL; if(!server) throw new Error('PDF → PowerPoint requires the conversion server.'); return serverConvert(file,'pdf-to-pptx',server); }
+export async function pdfToPPTX(file: File): Promise<ConvertResult> {
+  const server = import.meta.env.VITE_CONVERTER_API_URL;
+  if (!server) {
+    throw new Error('PDF → PowerPoint requires the QuadraConverter conversion server. Set VITE_CONVERTER_API_URL and deploy server/.');
+  }
+  return serverConvert(file, 'pdf-to-pptx', server, { language: 'eng' });
+}
 
 export async function pdfToExcel(
   file: File
