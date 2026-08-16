@@ -61,7 +61,7 @@ import urllib.request
 from pathlib import Path
 from io import BytesIO
 from typing import Any
-
+from urllib.parse import quote
 
 from fastapi import (
     FastAPI,
@@ -484,19 +484,30 @@ def file_response(
     work: Path,
     engine: str,
 ):
-
     verify_output(
         output,
         "Conversion",
     )
 
+    filename = output.name
+
+    encoded_filename = quote(
+        filename,
+        safe="",
+    )
+
     return FileResponse(
         path=str(output),
         media_type=media_type,
-        filename=output.name,
+        filename=filename,
         headers={
-            "X-Converted-Filename": output.name,
+            "Content-Disposition": (
+                f'attachment; filename="{filename}"; '
+                f"filename*=UTF-8''{encoded_filename}"
+            ),
+            "X-Converted-Filename": filename,
             "X-Conversion-Engine": engine,
+            "Cache-Control": "no-store",
         },
         background=BackgroundTask(
             cleanup,
