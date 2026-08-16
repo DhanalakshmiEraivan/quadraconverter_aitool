@@ -203,28 +203,70 @@ async function serverConvert(
   const blob = await response.blob();
   if (!blob.size) throw new Error('The conversion server returned an empty file.');
 
-  const disposition = response.headers.get('content-disposition') || '';
-  const headerFilename = response.headers.get('x-converted-filename') || '';
 
-  let filename = headerFilename.trim();
-  if (!filename) {
-    const utf8Match = disposition.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
-    const normalMatch = disposition.match(/filename\s*=\s*"([^"]+)"/i) || disposition.match(/filename\s*=\s*([^;]+)/i);
-    const raw = utf8Match?.[1] || normalMatch?.[1] || '';
-    if (raw) {
-      try {
-        filename = decodeURIComponent(raw.trim().replace(/^"|"$/g, ''));
-      } catch {
-        filename = raw.trim().replace(/^"|"$/g, '');
-      }
-    }
-  }
+ const disposition =
+  response.headers.get('content-disposition') || '';
 
-  if (!filename) {
-    const expected = expectedOutputForOperation(operation);
-    const base = file.name.replace(/\.[^.]+$/, '');
-    filename = `${base}${expected.extension || '.converted'}`;
+const headerFilename =
+  response.headers.get('x-converted-filename')?.trim() || '';
+
+let dispositionFilename = '';
+
+const utf8Match = disposition.match(
+  /filename\*=UTF-8''([^;]+)/i
+);
+
+if (utf8Match?.[1]) {
+  try {
+    dispositionFilename = decodeURIComponent(
+      utf8Match[1].trim().replace(/^["']|["']$/g, '')
+    );
+  } catch {
+    dispositionFilename = utf8Match[1].trim().replace(/^["']|["']$/g, '');
   }
+}
+
+if (!dispositionFilename) {
+  const normalMatch = disposition.match(
+    /filename="?([^";]+)"?/i
+  );
+
+  if (normalMatch?.[1]) {
+    dispositionFilename = normalMatch[1].trim();
+  }
+}
+
+/*
+ * Never use ".converted" for server conversions.
+ * The backend is responsible for returning the correct
+ * extension. If the browser cannot read the filename
+ * headers, derive the extension from the operation.
+ */
+const extensionByOperation: Record<string, string> = {
+  'pdf-to-word': '.docx',
+  'pdf-to-pptx': '.pptx',
+  'pdf-to-xlsx': '.xlsx',
+  'office-to-pdf': '.pdf',
+  'html-to-pdf': '.pdf',
+  'pdf-to-pdfa': '.pdf',
+  'pdf-unlock': '.pdf',
+  'pdf-protect': '.pdf',
+  'pdf-translate': '.pdf',
+};
+
+const originalBaseName =
+  file.name.replace(/\.[^.]+$/, '');
+
+const fallbackExtension =
+  extensionByOperation[operation] || '.bin';
+
+const fallbackFilename =
+  `${originalBaseName}${fallbackExtension}`;
+
+const filename =
+  headerFilename ||
+  dispositionFilename ||
+  fallbackFilename;
 
   // Never allow a backend/path-like filename to reach the browser download attribute.
   filename = filename.split(/[/\\]/).pop() || 'converted-file';
